@@ -25,6 +25,7 @@
 #include "llvm/Analysis/AliasSetTracker.h"
 #include "llvm/Analysis/AssumeBundleQueries.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/Loads.h"
 #include "llvm/Analysis/LoopAnalysisManager.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/LoopIterator.h"
@@ -322,14 +323,16 @@ std::pair<const SCEV *, const SCEV *> llvm::getStartAndEndForAccess(
     DenseMap<std::pair<const SCEV *, const SCEV *>,
              std::pair<const SCEV *, const SCEV *>> *PointerBounds,
     DominatorTree *DT, AssumptionCache *AC,
-    std::optional<ScalarEvolution::LoopGuards> &LoopGuards) {
+    std::optional<ScalarEvolution::LoopGuards> &LoopGuards,
+    bool AssumeInvariantBounds) {
   auto &DL = Lp->getHeader()->getDataLayout();
   Type *IdxTy = DL.getIndexType(PtrExpr->getType());
   const SCEV *EltSizeSCEV = SE->getStoreSizeOfExpr(IdxTy, AccessTy);
 
   // Delegate to the SCEV-based overload, passing through the cache.
   return getStartAndEndForAccess(Lp, PtrExpr, EltSizeSCEV, BTC, MaxBTC, SE,
-                                 PointerBounds, DT, AC, LoopGuards);
+                                 PointerBounds, DT, AC, LoopGuards,
+                                 AssumeInvariantBounds);
 }
 
 std::pair<const SCEV *, const SCEV *> llvm::getStartAndEndForAccess(
@@ -338,7 +341,8 @@ std::pair<const SCEV *, const SCEV *> llvm::getStartAndEndForAccess(
     DenseMap<std::pair<const SCEV *, const SCEV *>,
              std::pair<const SCEV *, const SCEV *>> *PointerBounds,
     DominatorTree *DT, AssumptionCache *AC,
-    std::optional<ScalarEvolution::LoopGuards> &LoopGuards) {
+    std::optional<ScalarEvolution::LoopGuards> &LoopGuards,
+    bool AssumeInvariantBounds) {
   std::pair<const SCEV *, const SCEV *> *PtrBoundsPair;
   if (PointerBounds) {
     auto [Iter, Ins] = PointerBounds->insert(
@@ -399,8 +403,16 @@ std::pair<const SCEV *, const SCEV *> llvm::getStartAndEndForAccess(
   } else
     return {SE->getCouldNotCompute(), SE->getCouldNotCompute()};
 
-  assert(SE->isLoopInvariant(ScStart, Lp) && "ScStart needs to be invariant");
-  assert(SE->isLoopInvariant(ScEnd, Lp) && "ScEnd needs to be invariant");
+  // When the loop is vectorized under a trip-count-invariant assumption, the
+  // bound (and hence BTC-derived ScStart/ScEnd) may still contain the in-loop
+  // bound load, which is only *assumed* invariant here. The assumption is
+  // discharged by the runtime memory alias check, and the in-loop leaf is
+  // materialized in a check-dominating block at expansion time. Tolerate the
+  // non-invariance in that case.
+  assert((AssumeInvariantBounds || SE->isLoopInvariant(ScStart, Lp)) &&
+         "ScStart needs to be invariant");
+  assert((AssumeInvariantBounds || SE->isLoopInvariant(ScEnd, Lp)) &&
+         "ScEnd needs to be invariant");
 
   // Add the size of the pointed element to ScEnd.
   ScEnd = SE->getAddExpr(ScEnd, EltSizeSCEV);
@@ -422,7 +434,8 @@ void RuntimePointerChecking::insert(Loop *Lp, Value *Ptr, const SCEV *PtrExpr,
   const SCEV *BTC = PSE.getBackedgeTakenCount();
   const auto &[ScStart, ScEnd] = getStartAndEndForAccess(
       Lp, PtrExpr, AccessTy, BTC, SymbolicMaxBTC, PSE.getSE(),
-      &DC.getPointerBounds(), DC.getDT(), DC.getAC(), LoopGuards);
+      &DC.getPointerBounds(), DC.getDT(), DC.getAC(), LoopGuards,
+      /*AssumeInvariantBounds=*/PSE.hasAssumedInvariantLoads());
   assert(!isa<SCEVCouldNotCompute>(ScStart) &&
          !isa<SCEVCouldNotCompute>(ScEnd) &&
          "must be able to compute both start and end expressions");
@@ -3175,13 +3188,169 @@ void LoopAccessInfo::collectStridedAccess(Value *MemAccess) {
   SymbolicStrides[Ptr] = cast<SCEVUnknown>(StrideBase);
 }
 
-LoopAccessInfo::LoopAccessInfo(Loop *L, ScalarEvolution *SE,
-                               const TargetTransformInfo *TTI,
-                               const TargetLibraryInfo *TLI, AAResults *AA,
-                               DominatorTree *DT, LoopInfo *LI,
-                               AssumptionCache *AC, bool AllowPartial)
+static bool isBoundLoadSafeToLoadAtCtx(Value *Ptr, Type *Ty, Align Alignment,
+                                       Instruction *CtxI, DominatorTree *DT,
+                                       AssumptionCache *AC) {
+  const DataLayout &DL = CtxI->getDataLayout();
+  for (DomTreeNode *Node = DT->getNode(CtxI->getParent()); Node;
+       Node = Node->getIDom()) {
+    BasicBlock *BB = Node->getBlock();
+    Instruction *ScanFrom =
+        (BB == CtxI->getParent()) ? CtxI : BB->getTerminator();
+    if (isSafeToLoadUnconditionally(Ptr, Ty, Alignment, DL, ScanFrom, AC, DT)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static bool isSafeToHoistBoundLoad(Instruction *I,
+                                   const SmallPtrSetImpl<Value *> &ModifiedPtrs,
+                                   Instruction *CtxI, DominatorTree *DT,
+                                   AssumptionCache *AC) {
+  if (auto *LI = dyn_cast<LoadInst>(I)) {
+    if (!LI->isSimple()) {
+      return false;
+    }
+    Value *Ptr = LI->getPointerOperand();
+    if (ModifiedPtrs.count(Ptr)) {
+      return false;
+    }
+    if (!isBoundLoadSafeToLoadAtCtx(Ptr, LI->getType(), LI->getAlign(), CtxI,
+                                    DT, AC)) {
+      return false;
+    }
+    return true;
+  }
+
+  // Limiting down the kind of instructions we can hoist to avoid any unforeseen
+  // side effects.
+  if (I->isBinaryOp() || I->isUnaryOp() || I->isCast() ||
+      isa<GetElementPtrInst>(I)) {
+    return isSafeToSpeculativelyExecute(I, CtxI, AC, DT);
+  }
+  return false;
+}
+
+LLVM_ABI bool llvm::collectInvariantLoadsBoundChain(
+    Loop *L, ScalarEvolution *SE, DominatorTree *DT, AssumptionCache *AC,
+    SmallVectorImpl<Instruction *> &HoistedDeps,
+    SmallVectorImpl<LoadInst *> &BoundLoads) {
+  HoistedDeps.clear();
+  BoundLoads.clear();
+
+  BasicBlock *ExitingBB = L->getExitingBlock();
+  if (!ExitingBB || ExitingBB != L->getLoopLatch()) {
+    return false;
+  }
+  auto *ExitBranch = dyn_cast<CondBrInst>(ExitingBB->getTerminator());
+  if (!ExitBranch) {
+    return false;
+  }
+  auto *ExitCmp = dyn_cast<ICmpInst>(ExitBranch->getCondition());
+  if (!ExitCmp) {
+    return false;
+  }
+  PHINode *IndVar = L->getInductionVariable(*SE);
+  if (!IndVar) {
+    return false;
+  }
+  Value *StepInst = IndVar->getIncomingValueForBlock(L->getLoopLatch());
+  auto IsIVOrStep = [&](Value *V) { return V == IndVar || V == StepInst; };
+
+  Value *DynamicUpperBound = nullptr;
+  if (IsIVOrStep(ExitCmp->getOperand(0))) {
+    DynamicUpperBound = ExitCmp->getOperand(1);
+  } else if (IsIVOrStep(ExitCmp->getOperand(1))) {
+    DynamicUpperBound = ExitCmp->getOperand(0);
+  } else {
+    return false;
+  }
+
+  /// Anything written inside the loop is a "not-invariant" pointer; the bound
+  /// load cannot share a pointer with such writes.
+  /// This is to prune out cases like for (i = 0; i < *Len; ++i) { Len[i] =
+  /// ..*.. }
+  SmallPtrSet<Value *, 16> ModifiedPtrs;
+  for (BasicBlock *BB : L->getBlocks()) {
+    for (Instruction &I : *BB) {
+      if (auto *SI = dyn_cast<StoreInst>(&I)) {
+        ModifiedPtrs.insert(SI->getPointerOperand());
+      }
+    }
+  }
+
+  BasicBlock *Preheader = L->getLoopPreheader();
+  if (!Preheader) {
+    return false;
+  }
+  Instruction *CtxI = Preheader->getTerminator();
+
+  // The bound must depend on at least one in-loop load (otherwise the loop
+  // would already be countable and this is unnecessary).
+  SmallVector<Instruction *, 16> Worklist;
+  SmallPtrSet<Instruction *, 16> VisitedForHoisting;
+  SmallPtrSet<Instruction *, 16> VisitedForChecking;
+
+  if (auto *I = dyn_cast<Instruction>(DynamicUpperBound)) {
+    Worklist.push_back(I);
+  }
+
+  while (!Worklist.empty()) {
+    Instruction *I = Worklist.back();
+
+    if (VisitedForHoisting.count(I)) {
+      Worklist.pop_back();
+      continue;
+    }
+
+    if (!L->contains(I->getParent())) {
+      Worklist.pop_back();
+      continue;
+    }
+
+    if (VisitedForChecking.insert(I).second) {
+      if (!isSafeToHoistBoundLoad(I, ModifiedPtrs, CtxI, DT, AC)) {
+        return false;
+      }
+
+      if (auto *LI = dyn_cast<LoadInst>(I)) {
+        BoundLoads.push_back(LI);
+      }
+
+      for (Use &U : I->operands()) {
+        if (auto *OpI = dyn_cast<Instruction>(U.get())) {
+          if (L->contains(OpI)) {
+            Worklist.push_back(OpI);
+          }
+        }
+      }
+
+      continue;
+    }
+
+    Worklist.pop_back();
+
+    VisitedForHoisting.insert(I);
+
+    HoistedDeps.push_back(I);
+  }
+
+  return !BoundLoads.empty() && !HoistedDeps.empty();
+}
+
+LoopAccessInfo::LoopAccessInfo(
+    Loop *L, ScalarEvolution *SE, const TargetTransformInfo *TTI,
+    const TargetLibraryInfo *TLI, AAResults *AA, DominatorTree *DT,
+    LoopInfo *LI, AssumptionCache *AC, bool AllowPartial,
+    ArrayRef<const SCEV *> AssumedInvariantLoads)
     : PSE(std::make_unique<PredicatedScalarEvolution>(*SE, *L)),
-      PtrRtChecking(nullptr), TheLoop(L), AllowPartial(AllowPartial) {
+      PtrRtChecking(nullptr), TheLoop(L), AllowPartial(AllowPartial),
+      AssumedInvariantLoads(AssumedInvariantLoads) {
+
+  for (const SCEV *Load : AssumedInvariantLoads)
+    PSE->assumeTripCountInvariant(Load);
+
   unsigned MaxTargetVectorWidthInBits = std::numeric_limits<unsigned>::max();
   if (TTI && !TTI->enableScalableVectorization())
     // Scale the vector width by 2 as rough estimate to also consider
@@ -3254,16 +3423,35 @@ void LoopAccessInfo::print(raw_ostream &OS, unsigned Depth) const {
 
 const LoopAccessInfo &LoopAccessInfoManager::getInfo(Loop &L,
                                                      bool AllowPartial) {
-  const auto &[It, Inserted] = LoopAccessInfoMap.try_emplace(&L);
+  return getInfo(L, AllowPartial, {});
+}
+
+const LoopAccessInfo &LoopAccessInfoManager::getInfo(
+    Loop &L, bool AllowPartial,
+    ArrayRef<const SCEV *> AssumedInvariantLoads) {
+  auto Insertion = LoopAccessInfoMap.try_emplace(&L);
+  auto It = Insertion.first;
+  bool Inserted = Insertion.second;
+
+  auto SameAssumedLoads = [&]() {
+    ArrayRef<const SCEV *> Cached = It->second->getAssumedInvariantLoads();
+    if (Cached.size() != AssumedInvariantLoads.size())
+      return false;
+    return std::equal(Cached.begin(), Cached.end(),
+                      AssumedInvariantLoads.begin());
+  };
 
   // We need to create the LoopAccessInfo if either we don't already have one,
   // or if it was created with a different value of AllowPartial.
-  if (Inserted || It->second->hasAllowPartial() != AllowPartial)
-    It->second = std::make_unique<LoopAccessInfo>(&L, &SE, TTI, TLI, &AA, &DT,
-                                                  &LI, AC, AllowPartial);
+  if (Inserted || It->second->hasAllowPartial() != AllowPartial ||
+      !SameAssumedLoads())
+    It->second =
+        std::make_unique<LoopAccessInfo>(&L, &SE, TTI, TLI, &AA, &DT, &LI, AC,
+                                         AllowPartial, AssumedInvariantLoads);
 
   return *It->second;
 }
+
 void LoopAccessInfoManager::clear() {
   // Collect LoopAccessInfo entries that may keep references to IR outside the
   // analyzed loop or SCEVs that may have been modified or invalidated. At the

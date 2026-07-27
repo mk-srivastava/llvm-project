@@ -412,6 +412,12 @@ static cl::opt<bool> EnableEarlyExitVectorization(
     cl::desc(
         "Enable vectorization of early exit loops with uncountable exits."));
 
+static cl::opt<bool> EnableVectorizeLoadsAsBound(
+    "enable-vectorize-loads-as-bound", cl::init(false), cl::Hidden,
+    cl::desc("Enable vectorization of loops whose trip count is uncountable "
+             "only because their upper bound is a load with a loop-invariant "
+             "address (example: for (i = 0; i < *Len; ++i))."));
+
 static cl::opt<bool> EnableEarlyExitVectorizationWithSideEffects(
     "enable-early-exit-vectorization-with-side-effects", cl::init(false),
     cl::Hidden,
@@ -7859,6 +7865,123 @@ static void connectEpilogueVectorLoop(VPlan &EpiPlan, Loop *L,
       Phi.eraseFromParent();
 }
 
+/// Return a copy of \p V that dominates the insertion point \p IP, cloning any
+/// operand instructions that do not already dominate \p IP (recursively). Loop-
+/// invariant roots (arguments, constants, values defined above \p IP) are
+/// returned unchanged. Clones are memoized in \p Cloned to preserve sharing.
+static Value *hoistBoundChainForDominance(Value *V, BasicBlock::iterator IP,
+                                          DominatorTree *DT,
+                                          DenseMap<Value *, Value *> &Cloned) {
+  auto *I = dyn_cast<Instruction>(V);
+  if (!I || DT->dominates(I, &*IP))
+    return V;
+  if (Value *C = Cloned.lookup(I))
+    return C;
+
+  Instruction *Clone = I->clone();
+  Clone->setName(I->getName() + ".bound.pre");
+  Clone->insertBefore(IP);
+  Cloned[I] = Clone;
+
+  for (Use &Op : Clone->operands())
+    Op.set(hoistBoundChainForDominance(Op.get(), Clone->getIterator(), DT,
+                                       Cloned));
+  return Clone;
+}
+
+/// Repair uses of in-loop bound loads that were assumed loop invariant (the
+/// no-hoist path in EnableLoadBoundVectorization). After vectorization, the
+/// runtime checks / trip count may reference such an in-loop load from a
+/// check/preheader block that the load does not dominate. Materialize a hoisted
+/// copy (plus any in-loop operand chain) in a dominating block and redirect the
+/// offending uses to it.
+static void repairAssumedInvariantBoundUses(Loop *L,
+                                            PredicatedScalarEvolution &PSE,
+                                            DominatorTree *DT) {
+  ArrayRef<const SCEV *> AssumedInvariantLoads = PSE.getAssumedInvariantLoads();
+  if (AssumedInvariantLoads.empty())
+    return;
+
+  for (const SCEV *S : AssumedInvariantLoads) {
+    const auto *U = dyn_cast<SCEVUnknown>(S);
+    if (!U)
+      continue;
+    auto *BoundLoad = dyn_cast<Instruction>(U->getValue());
+    if (!BoundLoad)
+      continue;
+
+    // Collect uses that the in-loop bound load does not dominate.
+    SmallVector<Use *, 4> NonDominatedUses;
+    for (Use &Usage : BoundLoad->uses())
+      if (!DT->dominates(BoundLoad, Usage))
+        NonDominatedUses.push_back(&Usage);
+    if (NonDominatedUses.empty())
+      continue;
+
+    // Insert the hoisted chain at a block dominating all offending uses.
+    BasicBlock *NCD = nullptr;
+    for (Use *Usage : NonDominatedUses) {
+      auto *UserI = cast<Instruction>(Usage->getUser());
+      BasicBlock *UseBB = isa<PHINode>(UserI)
+                              ? cast<PHINode>(UserI)->getIncomingBlock(*Usage)
+                              : UserI->getParent();
+      NCD = NCD ? DT->findNearestCommonDominator(NCD, UseBB) : UseBB;
+    }
+
+    DenseMap<Value *, Value *> Cloned;
+    Value *Hoisted = hoistBoundChainForDominance(
+        BoundLoad, NCD->getFirstNonPHIIt(), DT, Cloned);
+    for (Use *Usage : NonDominatedUses)
+      Usage->set(Hoisted);
+  }
+}
+
+bool EnableLoadBoundVectorization(Loop *L, PredicatedScalarEvolution &PSE,
+                                  ScalarEvolution *SE, DominatorTree *DT,
+                                  AssumptionCache *AC) {
+  if (!L->isInnermost() || !L->isLoopSimplifyForm() ||
+      L->getNumBackEdges() != 1 || !L->getUniqueExitBlock()) {
+    return false;
+  }
+
+  if (!isa<SCEVCouldNotCompute>(SE->getBackedgeTakenCount(L))) {
+    return false;
+  }
+
+  SmallVector<Instruction *, 16> HoistedDeps;
+  SmallVector<LoadInst *, 4> BoundLoads;
+  if (!collectInvariantLoadsBoundChain(L, SE, DT, AC, HoistedDeps,
+                                       BoundLoads)) {
+    return false;
+  }
+
+  // No hoisting here: we do not clone the bound's dependency chain into the
+  // preheader. Instead we register each in-loop bound load directly and *assume*
+  // it is loop invariant. That assumption is discharged by the runtime memory
+  // alias check; materializing the value before the loop (if still needed) is
+  // deferred to runtime-check / expansion time.
+  bool Added = false;
+  for (LoadInst *LI : BoundLoads) {
+    const SCEV *LoadSCEV = SE->getSCEV(LI);
+    if (!isa<SCEVUnknown>(LoadSCEV)) {
+      continue;
+    }
+    // Record the in-loop bound load as assumed loop invariant. That assumption
+    // is discharged by the runtime memory alias check; its invariance /
+    // dominance is repaired later by repairAssumedInvariantBoundUses.
+    PSE.assumeTripCountInvariant(LoadSCEV);
+    Added = true;
+  }
+  if (!Added) {
+    return false;
+  }
+
+  LLVM_DEBUG(dbgs() << "LV: Assuming in-loop bound load(s) invariant to make '"
+                    << L->getHeader()->getName()
+                    << "' countable (discharged by memory alias check).\n");
+  return true;
+}
+
 bool LoopVectorizePass::processLoop(Loop *L) {
   assert((EnableVPlanNativePath || L->isInnermost()) &&
          "VPlan-native path is not enabled. Only process inner loops.");
@@ -7897,6 +8020,10 @@ bool LoopVectorizePass::processLoop(Loop *L) {
   }
 
   PredicatedScalarEvolution PSE(*SE, *L);
+
+  if (EnableVectorizeLoadsAsBound && L->isInnermost()) {
+    EnableLoadBoundVectorization(L, PSE, SE, DT, AC);
+  }
 
   // Query this against the original loop and save it here because the profile
   // of the original loop header may change as the transformation happens.
@@ -8355,6 +8482,14 @@ bool LoopVectorizePass::processLoop(Loop *L) {
     LVP.executePlan(VF.Width, IC, BestPlan, LB, DT);
     ++LoopsVectorized;
   }
+
+  // If the loop was made countable via a trip-count-invariant assumption
+  // (no-hoist path), the runtime checks / trip count may have been expanded
+  // using the in-loop bound load, which does not dominate the check/preheader
+  // blocks. Materialize a hoisted copy (and any in-loop operand chain) and
+  // redirect those non-dominating uses. The assumption is discharged by the
+  // runtime memory alias check.
+  repairAssumedInvariantBoundUses(L, PSE, DT);
 
   assert(DT->verify(DominatorTree::VerificationLevel::Fast) &&
          "DT not preserved correctly");

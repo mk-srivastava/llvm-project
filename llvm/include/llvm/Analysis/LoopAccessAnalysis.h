@@ -26,6 +26,8 @@ namespace llvm {
 
 class AAResults;
 class DataLayout;
+class Instruction;
+class LoadInst;
 class Loop;
 class raw_ostream;
 class TargetTransformInfo;
@@ -694,7 +696,8 @@ public:
                           const TargetTransformInfo *TTI,
                           const TargetLibraryInfo *TLI, AAResults *AA,
                           DominatorTree *DT, LoopInfo *LI, AssumptionCache *AC,
-                          bool AllowPartial = false);
+                          bool AllowPartial = false,
+                          ArrayRef<const SCEV *> AssumedInvariantLoads = {});
 
   /// Return true we can analyze the memory accesses in the loop and there are
   /// no memory dependence cycles. Note that for dependences between loads &
@@ -713,6 +716,10 @@ public:
   /// results, it instead has partial results for those memory accesses that
   /// could be analyzed.
   bool hasAllowPartial() const { return AllowPartial; }
+
+  ArrayRef<const SCEV *> getAssumedInvariantLoads() const {
+    return AssumedInvariantLoads;
+  }
 
   const RuntimePointerChecking *getRuntimePointerChecking() const {
     return PtrRtChecking.get();
@@ -837,6 +844,10 @@ private:
   /// Determines whether we should generate partial runtime checks when not all
   /// memory accesses could be analyzed.
   bool AllowPartial;
+
+  /// In-loop bound loads used to compute the trip count which this analysis
+  /// assumes to be invariant (discharged by the runtime memory alias check).
+  SmallVector<const SCEV *, 2> AssumedInvariantLoads;
 
   unsigned NumLoads = 0;
   unsigned NumStores = 0;
@@ -970,14 +981,26 @@ LLVM_ABI std::pair<const SCEV *, const SCEV *> getStartAndEndForAccess(
     DenseMap<std::pair<const SCEV *, const SCEV *>,
              std::pair<const SCEV *, const SCEV *>> *PointerBounds,
     DominatorTree *DT, AssumptionCache *AC,
-    std::optional<ScalarEvolution::LoopGuards> &LoopGuards);
+    std::optional<ScalarEvolution::LoopGuards> &LoopGuards,
+    bool AssumeInvariantBounds = false);
 LLVM_ABI std::pair<const SCEV *, const SCEV *> getStartAndEndForAccess(
     const Loop *Lp, const SCEV *PtrExpr, const SCEV *EltSizeSCEV,
     const SCEV *BTC, const SCEV *MaxBTC, ScalarEvolution *SE,
     DenseMap<std::pair<const SCEV *, const SCEV *>,
              std::pair<const SCEV *, const SCEV *>> *PointerBounds,
     DominatorTree *DT, AssumptionCache *AC,
-    std::optional<ScalarEvolution::LoopGuards> &LoopGuards);
+    std::optional<ScalarEvolution::LoopGuards> &LoopGuards,
+    bool AssumeInvariantBounds = false);
+
+/// This function will detect whether the loop is uncountabel because the
+/// tripcount is based on a load. If yes, then it will build a dependency chain
+/// of instructions, and a list of loads which are used to compute the
+/// tripcount.
+LLVM_ABI bool
+collectInvariantLoadsBoundChain(Loop *L, ScalarEvolution *SE, DominatorTree *DT,
+                                AssumptionCache *AC,
+                                SmallVectorImpl<Instruction *> &HoistedDeps,
+                                SmallVectorImpl<LoadInst *> &BoundLoads);
 
 class LoopAccessInfoManager {
   /// The cache.
@@ -999,6 +1022,10 @@ public:
       : SE(SE), AA(AA), DT(DT), LI(LI), TTI(TTI), TLI(TLI), AC(AC) {}
 
   LLVM_ABI const LoopAccessInfo &getInfo(Loop &L, bool AllowPartial = false);
+
+  LLVM_ABI const LoopAccessInfo &
+  getInfo(Loop &L, bool AllowPartial,
+          ArrayRef<const SCEV *> AssumedInvariantLoads);
 
   LLVM_ABI void clear();
 

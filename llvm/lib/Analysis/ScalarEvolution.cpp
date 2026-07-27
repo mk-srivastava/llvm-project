@@ -2637,6 +2637,20 @@ bool ScalarEvolution::isAvailableAtLoopEntry(const SCEV *S, const Loop *L) {
   return isLoopInvariant(S, L) && properlyDominates(S, L->getHeader());
 }
 
+/// While a trip-count-invariant assumption is active (see
+/// computeBackedgeTakenCountAssumingInvariant), return true if \p S is an
+/// in-loop bound load that we are assuming to be loop invariant (and available
+/// at loop entry). The assumption is discharged by the runtime memory alias
+/// check. Returns false whenever no such assumption is active.
+static bool
+isAssumedInvariantValue(const SCEV *S,
+                        const SmallPtrSetImpl<const Value *> *Active) {
+  if (!Active || Active->empty())
+    return false;
+  const auto *U = dyn_cast<SCEVUnknown>(S);
+  return U && Active->count(U->getValue());
+}
+
 /// Get a canonical add expression, or something simpler if possible.
 const SCEV *ScalarEvolution::getAddExpr(SmallVectorImpl<SCEVUse> &Ops,
                                         SCEV::NoWrapFlags OrigFlags,
@@ -8676,6 +8690,37 @@ const SCEV *ScalarEvolution::getPredicatedConstantMaxBackedgeTakenCount(
   return getPredicatedBackedgeTakenInfo(L).getConstantMax(this, &Preds);
 }
 
+const SCEV *ScalarEvolution::computeBackedgeTakenCountAssumingInvariant(
+    const Loop *L, ArrayRef<const SCEV *> AssumedInvariantLoads,
+    bool SymbolicMax) {
+  if (AssumedInvariantLoads.empty())
+    return SymbolicMax ? getSymbolicMaxBackedgeTakenCount(L)
+                       : getBackedgeTakenCount(L);
+
+  // Collect the underlying values that we are assuming to be loop invariant.
+  SmallPtrSet<const Value *, 2> ActiveValues;
+  for (const SCEV *S : AssumedInvariantLoads) {
+    const auto *U = dyn_cast<SCEVUnknown>(S);
+    if (!U)
+      return getCouldNotCompute();
+    ActiveValues.insert(U->getValue());
+  }
+
+  (void)getBackedgeTakenInfo(L);
+
+  // While the assumption is active, loop/block disposition queries treat the
+  // assumed loads as invariant/dominating (and bypass their caches), which lets
+  // SCEV derive an exact count even though the bound is an in-loop load. The
+  // resulting count is therefore phrased in terms of the in-loop bound load;
+  // its dominance/invariance is repaired later, at expansion / runtime-check
+  // time.
+  SaveAndRestore<const SmallPtrSetImpl<const Value *> *> Active(
+      ActiveAssumedInvariantValues, &ActiveValues);
+  BackedgeTakenInfo BTI =
+      computeBackedgeTakenCount(L, /*AllowPredicates=*/false);
+  return SymbolicMax ? BTI.getSymbolicMax(L, this) : BTI.getExact(L, this);
+}
+
 bool ScalarEvolution::isBackedgeTakenCountMaxOrZero(const Loop *L) {
   return getBackedgeTakenInfo(L).isConstantMaxOrZero(this);
 }
@@ -14493,6 +14538,12 @@ void ScalarEvolution::print(raw_ostream &OS) const {
 
 ScalarEvolution::LoopDisposition
 ScalarEvolution::getLoopDisposition(const SCEV *S, const Loop *L) {
+  // While a trip-count-invariant assumption is active, bypass the disposition
+  // cache entirely: results computed under the assumption must never be
+  // persisted, or they would leak past the (scoped) assumption window.
+  if (ActiveAssumedInvariantValues && !ActiveAssumedInvariantValues->empty())
+    return computeLoopDisposition(S, L);
+
   auto &Values = LoopDispositions[S];
   for (auto &V : Values) {
     if (V.getPointer() == L)
@@ -14580,6 +14631,11 @@ ScalarEvolution::computeLoopDisposition(const SCEV *S, const Loop *L) {
                       : (HasUniform ? LoopUniform : LoopInvariant);
   }
   case scUnknown:
+    // An in-loop bound load that we are assuming to be loop invariant (see
+    // isAssumedInvariantValue) is treated as invariant for the duration of
+    // the assumption. The assumption is discharged by the runtime alias check.
+    if (isAssumedInvariantValue(S, ActiveAssumedInvariantValues))
+      return LoopInvariant;
     // All non-instruction values are loop invariant.  All instructions are loop
     // invariant if they are not contained in the specified loop.
     // Instructions are never considered invariant in the function body
@@ -14608,6 +14664,11 @@ bool ScalarEvolution::hasComputableLoopEvolution(const SCEV *S, const Loop *L) {
 
 ScalarEvolution::BlockDisposition
 ScalarEvolution::getBlockDisposition(const SCEV *S, const BasicBlock *BB) {
+  // See getLoopDisposition: bypass the cache while an assumption is active so
+  // assumption-tainted dominance results are never persisted.
+  if (ActiveAssumedInvariantValues && !ActiveAssumedInvariantValues->empty())
+    return computeBlockDisposition(S, BB);
+
   auto &Values = BlockDispositions[S];
   for (auto &V : Values) {
     if (V.getPointer() == BB)
@@ -14667,6 +14728,10 @@ ScalarEvolution::computeBlockDisposition(const SCEV *S, const BasicBlock *BB) {
     return Proper ? ProperlyDominatesBlock : DominatesBlock;
   }
   case scUnknown:
+    // An in-loop bound load assumed to be loop invariant is also assumed to be
+    // available at (and thus to properly dominate) the loop entry.
+    if (isAssumedInvariantValue(S, ActiveAssumedInvariantValues))
+      return ProperlyDominatesBlock;
     if (Instruction *I =
           dyn_cast<Instruction>(cast<SCEVUnknown>(S)->getValue())) {
       if (I->getParent() == BB)
@@ -15684,6 +15749,7 @@ const SCEV *PredicatedScalarEvolution::getPredicatedSCEV(const SCEV *Expr) {
     Expr = Entry.second;
 
   const SCEV *NewSCEV = SE.rewriteUsingPredicate(Expr, &L, *Preds);
+
   Entry = {Generation, NewSCEV};
 
   return NewSCEV;
@@ -15691,21 +15757,38 @@ const SCEV *PredicatedScalarEvolution::getPredicatedSCEV(const SCEV *Expr) {
 
 const SCEV *PredicatedScalarEvolution::getBackedgeTakenCount() {
   if (!BackedgeCount) {
-    SmallVector<const SCEVPredicate *, 4> Preds;
-    BackedgeCount = SE.getPredicatedBackedgeTakenCount(&L, Preds);
-    for (const auto *P : Preds)
-      addPredicate(*P);
+    if (!AssumedInvariantLoads.empty()) {
+      // Compute the backedge taken count while assuming the in-loop bound
+      // loads are loop invariant. SCEV can only derive an exact count when the
+      // loop bound (RHS of the exit condition) is loop invariant (see
+      // howManyLessThans); the assumption lets it do so directly in terms of
+      // the in-loop load. This intentionally leaves the count non-invariant
+      // (the inside loads do not dominate the preheader); that dominance /
+      // invariance is repaired later, at expansion / runtime-check time.
+      BackedgeCount = SE.computeBackedgeTakenCountAssumingInvariant(
+          &L, AssumedInvariantLoads, /*SymbolicMax=*/false);
+    } else {
+      SmallVector<const SCEVPredicate *, 4> Preds;
+      BackedgeCount = SE.getPredicatedBackedgeTakenCount(&L, Preds);
+      for (const auto *P : Preds)
+        addPredicate(*P);
+    }
   }
   return BackedgeCount;
 }
 
 const SCEV *PredicatedScalarEvolution::getSymbolicMaxBackedgeTakenCount() {
   if (!SymbolicMaxBackedgeCount) {
-    SmallVector<const SCEVPredicate *, 4> Preds;
-    SymbolicMaxBackedgeCount =
-        SE.getPredicatedSymbolicMaxBackedgeTakenCount(&L, Preds);
-    for (const auto *P : Preds)
-      addPredicate(*P);
+    if (!AssumedInvariantLoads.empty()) {
+      SymbolicMaxBackedgeCount = SE.computeBackedgeTakenCountAssumingInvariant(
+          &L, AssumedInvariantLoads, /*SymbolicMax=*/true);
+    } else {
+      SmallVector<const SCEVPredicate *, 4> Preds;
+      SymbolicMaxBackedgeCount =
+          SE.getPredicatedSymbolicMaxBackedgeTakenCount(&L, Preds);
+      for (const auto *P : Preds)
+        addPredicate(*P);
+    }
   }
   return SymbolicMaxBackedgeCount;
 }
@@ -15728,6 +15811,19 @@ void PredicatedScalarEvolution::addPredicate(const SCEVPredicate &Pred) {
   NewPreds.push_back(&Pred);
   Preds = std::make_unique<SCEVUnionPredicate>(NewPreds, SE);
   updateGeneration();
+}
+
+void PredicatedScalarEvolution::assumeTripCountInvariant(const SCEV *Load) {
+  const auto *V = dyn_cast<SCEVUnknown>(Load);
+  assert(V && "assumed-invariant Load must be a SCEVUnknown");
+  (void)V;
+
+  if (!is_contained(AssumedInvariantLoads, Load)) {
+    AssumedInvariantLoads.push_back(Load);
+    BackedgeCount = nullptr;
+    SymbolicMaxBackedgeCount = nullptr;
+    SmallConstantMaxTripCount.reset();
+  }
 }
 
 void PredicatedScalarEvolution::addPredicates(
@@ -15787,7 +15883,8 @@ PredicatedScalarEvolution::PredicatedScalarEvolution(
     : RewriteMap(Init.RewriteMap), SE(Init.SE), L(Init.L),
       Preds(std::make_unique<SCEVUnionPredicate>(Init.Preds->getPredicates(),
                                                  SE)),
-      Generation(Init.Generation), BackedgeCount(Init.BackedgeCount) {}
+      Generation(Init.Generation), BackedgeCount(Init.BackedgeCount),
+      AssumedInvariantLoads(Init.AssumedInvariantLoads) {}
 
 void PredicatedScalarEvolution::print(raw_ostream &OS, unsigned Depth) const {
   // For each block.

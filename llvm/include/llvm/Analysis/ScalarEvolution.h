@@ -1122,6 +1122,13 @@ public:
   LLVM_ABI const SCEV *getPredicatedSymbolicMaxBackedgeTakenCount(
       const Loop *L, SmallVectorImpl<const SCEVPredicate *> &Predicates);
 
+  /// Compute the backedge-taken count while assuming that the given in-loop
+  /// bound loads are loop invariant (and available at loop entry). The
+  /// assumption is discharged by the runtime memory alias check.
+  LLVM_ABI const SCEV *computeBackedgeTakenCountAssumingInvariant(
+      const Loop *L, ArrayRef<const SCEV *> AssumedInvariantLoads,
+      bool SymbolicMax = false);
+
   /// Return true if the backedge taken count is either the value returned by
   /// getConstantMaxBackedgeTakenCount or zero.
   LLVM_ABI bool isBackedgeTakenCountMaxOrZero(const Loop *L);
@@ -1890,6 +1897,12 @@ private:
   /// function as they are computed.
   DenseMap<const Loop *, BackedgeTakenInfo> PredicatedBackedgeTakenCounts;
 
+  /// While non-null, the underlying values of these SCEVUnknown loads are
+  /// treated as loop invariant / dominating the loop entry by the loop and
+  /// block disposition queries (which also bypass their caches). Set only for
+  /// the duration of computeBackedgeTakenCountAssumingInvariant.
+  const SmallPtrSetImpl<const Value *> *ActiveAssumedInvariantValues = nullptr;
+
   /// Loops whose backedge taken counts directly use this non-constant SCEV.
   DenseMap<const SCEV *, SmallPtrSet<PointerIntPair<const Loop *, 1, bool>, 4>>
       BECountUsers;
@@ -2655,6 +2668,20 @@ public:
   /// Adds a new predicate.
   LLVM_ABI void addPredicate(const SCEVPredicate &Pred);
 
+  /// Record that the in-loop bound load \p Load may be assumed loop invariant
+  /// (and available at loop entry) when computing the backedge-taken count.
+  /// The assumption is discharged by the runtime memory alias check; the
+  /// resulting dominance/invariance is repaired later by the vectorizer.
+  LLVM_ABI void assumeTripCountInvariant(const SCEV *Load);
+
+  LLVM_ABI bool hasAssumedInvariantLoads() const {
+    return !AssumedInvariantLoads.empty();
+  }
+
+  LLVM_ABI ArrayRef<const SCEV *> getAssumedInvariantLoads() const {
+    return AssumedInvariantLoads;
+  }
+
   /// Adds all predicates in \p Preds.
   LLVM_ABI void addPredicates(ArrayRef<const SCEVPredicate *> Preds);
 
@@ -2725,6 +2752,10 @@ private:
 
   /// The symbolic backedge taken count.
   const SCEV *SymbolicMaxBackedgeCount = nullptr;
+
+  /// In-loop bound loads (as SCEVUnknown) that are assumed to be loop
+  /// invariant when computing the backedge-taken count.
+  SmallVector<const SCEV *, 2> AssumedInvariantLoads;
 
   /// The constant max trip count for the loop.
   std::optional<unsigned> SmallConstantMaxTripCount;
